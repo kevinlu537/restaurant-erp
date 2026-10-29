@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Restaurant Inventory Management</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header><p class="eyebrow">INVENTORY WORKSPACE</p><h1>Restaurant Inventory Management</h1><p>Record incoming stock and consumption. Keep your remaining stock accurate.</p></header>
+    <p id="storage-error" class="error" role="alert" hidden></p>
+    <section aria-labelledby="inventory-title">
+      <h2 id="inventory-title">Current Inventory</h2>
+      <div class="table-wrap"><table><thead><tr><th scope="col">Ingredient</th><th scope="col">Quantity</th><th scope="col">Unit</th></tr></thead><tbody id="inventory-body"></tbody></table></div>
+    </section>
+    <div class="forms">
+      <section aria-labelledby="incoming-title"><h2 id="incoming-title">Record Incoming Stock</h2>
+        <form id="incoming-form" novalidate>
+          <label for="incoming-ingredient">Ingredient</label><select id="incoming-ingredient" name="ingredient"><option value="beef">Beef</option></select>
+          <label for="incoming-quantity">Quantity (kg)</label><input id="incoming-quantity" name="quantity" type="text" inputmode="decimal" placeholder="0.00" aria-describedby="incoming-help" required><small id="incoming-help">Enter a positive quantity with up to two decimal places.</small>
+          <label for="incoming-date">Transaction Date</label><input id="incoming-date" name="date" type="date" required>
+          <button type="submit">Record Incoming Stock</button><p id="incoming-message" class="message" role="status" aria-live="polite"></p>
+        </form>
+      </section>
+      <section aria-labelledby="consumption-title"><h2 id="consumption-title">Record Consumption</h2>
+        <form id="consumption-form" novalidate>
+          <label for="consumption-ingredient">Ingredient</label><select id="consumption-ingredient" name="ingredient"><option value="beef">Beef</option></select>
+          <label for="consumption-quantity">Quantity (kg)</label><input id="consumption-quantity" name="quantity" type="text" inputmode="decimal" placeholder="0.00" aria-describedby="consumption-help" required><small id="consumption-help">Enter a positive quantity with up to two decimal places.</small>
+          <label for="consumption-date">Transaction Date</label><input id="consumption-date" name="date" type="date" required>
+          <button type="submit">Record Consumption</button><p id="consumption-message" class="message" role="status" aria-live="polite"></p>
+        </form>
+      </section>
+    </div>
+    <section aria-labelledby="history-title"><h2 id="history-title">Transaction History</h2><p>Records appear in the order entered. Dates are labels and do not recalculate past balances.</p>
+      <div class="table-wrap"><table><thead><tr><th scope="col">Date</th><th scope="col">Ingredient</th><th scope="col">Transaction Type</th><th scope="col">Quantity</th><th scope="col">Unit</th><th scope="col">Remaining Stock</th></tr></thead><tbody id="history-body"></tbody></table></div>
+    </section>
+    <footer>Prototype data is saved in this browser only. Clearing browser storage may remove your records.</footer>
+  </main>
+</body>
+</html>

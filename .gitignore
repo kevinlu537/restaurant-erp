@@ -1,0 +1,25 @@
+# Local environment settings and credentials
+.env
+.env.*
+!.env.example
+.git-credentials
+.npmrc
+credentials.json
+secrets.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Editor settings and temporary files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs and operating system metadata
+*.log
+.DS_Store
+Thumbs.db
+Desktop.ini
