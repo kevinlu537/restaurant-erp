@@ -1,0 +1,12 @@
+caption { text-align: left; color: #536575; padding-bottom: 12px; }
+#connection-status { font-weight: 700; color: #172b3a; }
+#refresh { width: auto; min-width: 180px; margin-top: 4px; }
+a { color: #105d52; text-underline-offset: 3px; }
+td { white-space: normal; overflow-wrap: anywhere; }
+
+fieldset { border: 1px solid #dce4e9; border-radius: 8px; padding: 18px; margin-top: 20px; }
+#write-controls form { padding: 12px; min-width: 0; }
+#write-message { min-height: 1.6em; }
+fieldset:disabled { opacity: .65; }
+#sign-in { max-width: 420px; }
+#sign-out { width: auto; }
