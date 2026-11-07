@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Week 2 Restaurant Inventory</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="week2.css">
+  <script src="week2-config.js" defer></script>
+  <script src="week2.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">WEEK 2 · INVENTORY MANAGEMENT</p>
+      <h1>Restaurant Inventory</h1>
+      <p>Review available ingredients and stock movements.</p>
+      <a href="index.html">Open the Week 1 browser inventory</a>
+    </header>
+    <section aria-labelledby="connection-title">
+      <h2 id="connection-title">Data connection</h2>
+      <p id="connection-status" role="status" aria-live="polite">Not Connected · Data source: Connection unavailable</p>
+      <p id="connection-detail">Supabase access has not been configured or approved for this page. No live inventory has been loaded.</p>
+      <p id="connection-error" class="error" role="alert" hidden></p>
+      <button id="refresh" type="button" disabled>Refresh inventory</button>
+    </section>
+    <section aria-labelledby="stock-title" id="stock-section">
+      <h2 id="stock-title">Current stock</h2>
+      <div class="table-wrap"><table>
+        <caption>Available ingredients and quantities</caption>
+        <thead><tr><th scope="col">Ingredient</th><th scope="col">Category</th><th scope="col">Quantity</th><th scope="col">Unit</th></tr></thead>
+        <tbody id="stock-body"><tr><td colspan="4">Inventory is unavailable until the connection is approved.</td></tr></tbody>
+      </table></div>
+    </section>
+    <section aria-labelledby="history-title" id="history-section">
+      <h2 id="history-title">Inventory history</h2>
+      <p>Oldest ledger entry first. Transaction dates are record labels.</p>
+      <div class="table-wrap"><table>
+        <caption>Stock received and consumed</caption>
+        <thead><tr><th scope="col">Sequence</th><th scope="col">Ingredient</th><th scope="col">Transaction type</th><th scope="col">Quantity</th><th scope="col">Unit</th><th scope="col">Date</th></tr></thead>
+        <tbody id="history-body"><tr><td colspan="6">History is unavailable until the connection is approved.</td></tr></tbody>
+      </table></div>
+    </section>
+    <section aria-labelledby="manage-title">
+      <h2 id="manage-title">Administrator inventory management</h2>
+      <p id="auth-status" role="status" aria-live="polite">Write integration is not enabled. Public inventory reads remain available.</p>
+      <form id="sign-in" novalidate>
+        <label for="operator-email">Operator email</label><input id="operator-email" name="email" type="email" autocomplete="username" required>
+        <label for="operator-password">Password</label><input id="operator-password" name="password" type="password" autocomplete="current-password" required>
+        <button id="sign-in-button" type="submit" disabled>Sign in</button>
+      </form>
+      <button id="sign-out" type="button" disabled>Sign out</button>
+      <p id="write-message" role="status" aria-live="polite"></p>
+      <fieldset id="write-controls" disabled><legend>Authorized operator actions</legend>
+        <div class="forms">
+          <form id="add-ingredient" data-action="add_ingredient" novalidate>
+            <h3>Add ingredient</h3>
+            <label for="ingredient-name">Name</label><input id="ingredient-name" name="name" maxlength="200" required>
+            <label for="ingredient-category">Category</label><input id="ingredient-category" name="category" maxlength="200" required>
+            <label for="ingredient-unit">Unit</label><select id="ingredient-unit" name="unit_id"><option value="10000000-0000-4000-8000-000000000001">lb</option><option value="10000000-0000-4000-8000-000000000002">pt</option><option value="10000000-0000-4000-8000-000000000003">fl oz</option><option value="10000000-0000-4000-8000-000000000004">each</option></select>
+            <button type="submit">Add ingredient</button>
+          </form>
+          <form id="receive-stock" data-action="receive_stock" novalidate>
+            <h3>Receive stock</h3><label for="receive-stock-ingredient">Ingredient</label><select id="receive-stock-ingredient" name="ingredient_id" required><option value="">Refresh inventory to select an ingredient</option></select>
+            <label for="receive-stock-quantity">Quantity</label><input id="receive-stock-quantity" name="quantity" inputmode="decimal" maxlength="128" required>
+            <label for="receive-stock-date">Transaction date</label><input id="receive-stock-date" name="date" type="date" required>
+            <button type="submit">Receive stock</button>
+          </form>
+          <form id="consume-stock" data-action="consume_stock" novalidate>
+            <h3>Consume stock</h3><label for="consume-stock-ingredient">Ingredient</label><select id="consume-stock-ingredient" name="ingredient_id" required><option value="">Refresh inventory to select an ingredient</option></select>
+            <label for="consume-stock-quantity">Quantity</label><input id="consume-stock-quantity" name="quantity" inputmode="decimal" maxlength="128" required>
+            <label for="consume-stock-date">Transaction date</label><input id="consume-stock-date" name="date" type="date" required>
+            <button type="submit">Consume stock</button>
+          </form>
+          <form id="deactivate-ingredient" data-action="deactivate_ingredient" novalidate>
+            <h3>Deactivate ingredient</h3><label for="deactivate-ingredient-ingredient">Ingredient</label><select id="deactivate-ingredient-ingredient" name="ingredient_id" required><option value="">Refresh inventory to select an ingredient</option></select>
+            <button type="submit">Deactivate ingredient</button>
+          </form>
+        </div>
+      </fieldset>
+      <p>Use a new fictional ingredient for demonstrations. Persistent history is retained after deactivation.</p>
+    </section>
+    <noscript><p class="error">Enable JavaScript to display inventory when a connection is available.</p></noscript>
+    <footer>This separate Week 2 page does not read or write Week 1 browser inventory data.</footer>
+  </main>
+</body>
+</html>
