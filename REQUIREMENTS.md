@@ -1,5 +1,43 @@
 # Restaurant ERP System Requirements
 
+## Current approved delivery scope — 2026-11-08
+
+The Gateway Company simulated-internship deliverable now includes two separate
+English-only applications. Week 1 remains the original localStorage prototype.
+Week 2 uses the Supabase database, public stock/history views, Supabase Auth and a
+restricted Edge Function for add ingredient, receive stock, consume stock and
+deactivate ingredient. Restaurant-owner needs informed this scope; no supervisor
+approval is inferred. See README.md for architecture, setup and evidence classification.
+
+Week 2 quantities remain exact decimal text; whole-number counts are required for
+`each`. The server enforces positive bounded quantities, sufficient balance, active
+ingredients and zero balance before deactivation. Inventory changes use the existing
+ledger and M3 functions; deactivation preserves history. Dates are record labels.
+The UI refreshes authoritative views after confirmed commits and never retries an
+ambiguous write. UNKNOWN outcomes lock submissions pending operator reconciliation.
+
+Public frontend writes remain disabled. Controlled demonstrations require approved
+operator authentication, exact server allowlisting, temporary server activation and
+authenticated shutdown verification. ES256 gateway verification, approved-origin
+CORS, strict database TLS and the restricted caller remain required. Public keys
+are configuration, not write authorization. Never expose erp_private or privileged
+credentials in browser assets.
+
+Final accepted demonstration state is six original active ingredients, twelve
+history records and two inactive fictional fixtures. F4-4B verified seven real
+browser submissions: five commits and two business-rule rollbacks, with original
+records preserved. README.md distinguishes LIVE PASS, MOCK PASS, STATIC PASS and
+NOT TESTED. Continuous production use, clean rebuild/recovery and concurrency are
+not established by these results. AI scanning, analytics, forecasting and new
+features are outside this delivery. Week 1 data must not be migrated or altered.
+
+## Historical Week 1 requirements and authorization record
+
+The sections below preserve the original prototype contract. Their exclusions,
+acceptance statements and future-approval wording are scoped to that earlier stage;
+they do not negate the separately approved Week 2 scope above. AGENTS.md also
+retains historical prototype context; follow the current explicit step authorization.
+
 ## Mandatory Language Requirement (High Priority)
 - The Restaurant ERP System must be an English-only website.
 - All user-facing content must be in English, including navigation, page titles, buttons, tables, forms, validation messages, notifications, and error messages.

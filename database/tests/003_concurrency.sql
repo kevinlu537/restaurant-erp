@@ -1,0 +1,115 @@
+-- PREPARED ONLY. COORDINATION MATERIAL, NOT A SINGLE-SESSION TEST RUNNER.
+-- All steps require separate test authorization, an isolated development DB,
+-- M1-M5, and the approved postgres coordinator with exact P5-I1 memberships.
+-- Verify the pinned platform grantor and both membership rows per ERP role.
+-- No memberships are added by these tests. No new helper files.
+-- Execute only the explicitly selected block in its assigned session.
+-- Capture session identity, isolation, lock waits, errors, commit times, ledger,
+-- balances and sequence values. Use READ COMMITTED in every business session.
+-- Set bounded lock_timeout per approved test plan. A timeout is not a business
+-- rejection and must not be recorded as proof of a passing concurrency test.
+-- Fixture IDs below are psql-style variables, NOT ready-to-run SQL literals.
+-- Bind them only in a separately approved client; do not embed credentials.
+
+-- FIXTURE PREPARATION (trusted session; commit only under test approval):
+-- SET ROLE erp_admin_caller;
+-- SELECT erp_private.create_ingredient('Race Consumption','Test',
+--   '10000000-0000-4000-8000-000000000001') AS ingredient_id;
+-- Record the UUID as race_id. Add incoming '10' through the controlled function.
+-- Create a separate zero-stock active ingredient as zero_id, and a separate
+-- ingredient as supplier_race_id. Create a fictional supplier as race_supplier
+-- through separately authorized owner fixture setup, not a new business RPC.
+
+-- C01 SESSION A:
+-- BEGIN ISOLATION LEVEL READ COMMITTED;
+-- SET LOCAL ROLE erp_admin_caller;
+-- SELECT * FROM erp_private.record_inventory_transaction(:'race_id'::uuid,
+--   'CONSUMPTION','7',DATE '2026-01-01');
+-- Keep transaction open; signal B after function returns.
+-- C01 SESSION B:
+-- BEGIN ISOLATION LEVEL READ COMMITTED;
+-- SET LOCAL ROLE erp_admin_caller;
+-- SELECT * FROM erp_private.record_inventory_transaction(:'race_id'::uuid,
+--   'CONSUMPTION','7',DATE '2026-01-01');
+-- Must wait. A commits, then B must reject with 23514. Roll back B.
+-- Expected: one consumption, current balance 3, never negative prefix balance.
+-- Repeat with A rollback: B should succeed, balance 3, not use stale state.
+
+-- C02 DEACTIVATION FIRST:
+-- A begins, calls deactivate_ingredient(zero_id), holds open.
+-- B begins, attempts incoming '1' for zero_id; must wait.
+-- A commits. B must reject inactive ingredient (22023), then roll back.
+-- Reverse on a fresh zero-stock fixture: A records incoming '1', holds open;
+-- B deactivates and waits. A commits; B rejects nonzero stock (23514).
+-- Expected: no inactive ingredient receives a post-deactivation transaction.
+
+-- C03 SUPPLIER UPDATE FIRST (owner-only test maintenance, no management RPC):
+-- A: BEGIN; SET LOCAL ROLE erp_table_owner;
+-- UPDATE erp_private.suppliers SET is_active=false WHERE id=:'race_supplier'::uuid;
+-- Hold open. B as admin caller attempts INCOMING '1' with that supplier and
+-- supplier_race_id; must wait. A commits; B rejects inactive supplier (22023).
+-- Reverse with an active fixture: A as admin records incoming with supplier,
+-- holds open; B as owner attempts supplier is_active=false; must wait.
+-- A commits; B may commit deactivation. Historical reference remains valid.
+-- Any later incoming assignment must reject. Owner maintenance obtains no
+-- ingredient locks after taking the supplier lock.
+
+-- D03 UNIT DEFINITION / FIRST USE RACE:
+-- Use separately approved unused unit and zero-history ingredient fixtures.
+-- A records first incoming and holds open. B as owner changes unit name/type;
+-- B waits for unit SHARE lock, then rejects historical alteration after A commit.
+-- Reverse: B changes definition and holds; A waits, then sees committed new
+-- definition before insertion. No unit change may occur after historical use.
+-- Ingredient unit reassignment races serialize on the ingredient row as well.
+
+-- D05 SEQUENCE:
+-- Alternate writers on the SAME ingredient in distinct sessions; numeric
+-- sequence order must match serialized insertion order (CACHE 1).
+-- Roll back an inserted transaction: row disappears, allocated value is lost.
+-- Backdate next business date: sequence still increases, history appends.
+-- DIFFERENT ingredients: A allocates sequence, holds open; B inserts/commits.
+-- A commits later: numerical order is NOT cross-ingredient commit order.
+-- No global application lock should block B merely because A holds another
+-- ingredient. Shared reference-unit and supplier SHARE locks are compatible.
+-- Do not use a high sequence watermark as proof that lower values committed.
+
+-- DEADLOCK / FAILURE EVIDENCE:
+-- Lock order is ingredient -> unit -> supplier. All future multi-ingredient
+-- operations would need deterministic ingredient order and separate approval.
+-- Never use supplier -> ingredient maintenance while ordinary writers run.
+-- Deadlock 40P01 or serialization/known rollback errors may permit bounded
+-- retry only after confirmed rollback. Connection loss after commit is ambiguous:
+-- inspect trusted ledger and reconcile; do not blindly submit again.
+-- Clean-up/reset and restoration of committed fixture data require separate
+-- approval. Do not delete ledger records or disable guards for cleanup.
+
+-- I2 EVIDENCE / COORDINATION ADDENDUM (Requires Live Verification):
+-- For every scenario record session_user/current_user, isolation, fixture UUIDs,
+-- backend IDs, function result/error, lock-wait evidence, and commit/rollback
+-- acknowledgments. The coordinator explicitly signals each barrier; avoid
+-- timing-only sleeps. Verify B is waiting on A before releasing A. Inspect locks
+-- from a separately approved observer; do not grant monitoring rights to callers.
+-- Confirm direct erp_admin_caller LOGIN separately: SET ROLE from an administrator
+-- session proves neither connection support nor absence of inherited privilege.
+--
+-- CONSUMPTION VERSUS DEACTIVATION: fresh ingredient balance 1. A consumes '1'
+-- and holds. B deactivates, waits, then succeeds after A commits (balance zero).
+-- Repeat with A rollback: B observes balance 1 and rejects deactivation.
+-- Reverse: A attempts deactivation of nonzero stock and must reject without
+-- changing status; B can subsequently consume. Also retain the zero-stock
+-- deactivation-versus-incoming cases above. Use new fixtures for each variant.
+--
+-- POST-LOCK SNAPSHOT PROOF: B begins its transaction BEFORE A commits. B waits
+-- on the ingredient row, then must calculate from A's newly committed ledger
+-- in a subsequent statement. Record the initial and final sums; one-session
+-- arithmetic or source inspection does not establish this property.
+--
+-- For supplier and historical-unit races repeat the blocker-rollback ordering:
+-- a rollback must not make a supplier inactive or freeze an unused definition.
+-- Verify data with a trusted reader after each scenario, including every
+-- per-ingredient prefix SUM in ledger_sequence order being nonnegative.
+-- Distinct-ingredient writes sharing the same unit/supplier should progress
+-- through compatible SHARE locks; do not require global commit ordering.
+-- Record SQLSTATE 40P01/timeouts as failures needing analysis, not passes.
+-- All fixture writes, multi-session execution and recovery remain separately
+-- authorized; this document neither runs them nor approves API exposure.
