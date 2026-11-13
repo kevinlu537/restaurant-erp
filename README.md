@@ -1,5 +1,13 @@
 # Gateway Company Restaurant ERP Inventory MVP
 
+## Week 3 local submission
+
+See [WEEK3-SUBMISSION.md](WEEK3-SUBMISSION.md) for the current local features,
+offline evidence, pending migrations 005–007, and deployment limitations. The Week 2
+delivery narrative below is historical; its disabled-frontend-flag statements do
+not describe the current local `week2-config.js`, where `writeEnabled` is true.
+The current server write-gate state has not been independently verified.
+
 ## Final delivery status — 2026-11-08
 
 This English-only inventory MVP was developed for a Gateway Company simulated

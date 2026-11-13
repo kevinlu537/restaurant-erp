@@ -4,6 +4,11 @@ import postgres from "postgres";
 export function createInventoryHandler(config, connect, verifyFetch = fetch) {
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
   const units = new Set([1,2,3,4].map(n => "10000000-0000-4000-8000-00000000000" + n));
+  const calendarDate = value => {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    const [y,m,d] = value.split("-").map(Number), leap = y%4===0 && (y%100!==0 || y%400===0);
+    return y>=1 && m>=1 && m<=12 && d>=1 && d<=[31,leap?29:28,31,30,31,30,31,31,30,31,30,31][m-1];
+  };
   let origin, project, users;
   try {
     origin = new URL(config.frontendOrigin);
@@ -32,6 +37,7 @@ export function createInventoryHandler(config, connect, verifyFetch = fetch) {
       return reply(401, "REJECTED", "Sign in required.");
     const controller = new AbortController();
     const authTimer = setTimeout(() => controller.abort(), 10000);
+    let verifiedOperatorId;
     try {
       const response = await verifyFetch(project.origin + "/auth/v1/user", { method: "GET", redirect: "error",
         credentials: "omit", signal: controller.signal,
@@ -39,10 +45,11 @@ export function createInventoryHandler(config, connect, verifyFetch = fetch) {
       if (!response.ok) return reply(401, "REJECTED", "Session not accepted.");
       const user = await response.json();
       if (typeof user.id !== "string" || !users.includes(user.id)) return reply(403, "REJECTED", "Operator not authorized.");
+      verifiedOperatorId = user.id;
     } catch { return reply(401, "REJECTED", "Session verification unavailable."); }
     finally { clearTimeout(authTimer); }
-    // Only the exact server-configured string enables writes; HTTP input is ignored.
-    if (config.writesEnabled !== "true") return reply(503, "REJECTED", "Inventory writes are disabled.");
+    // Auth/allowlisting applies to both read and write actions. Only the exact
+    // server string enables writes; protected reads do not enable or bypass writes.
     let payload;
     try {
       if (!(request.headers.get("content-type") || "").toLowerCase().startsWith("application/json")) throw new Error();
@@ -58,16 +65,43 @@ export function createInventoryHandler(config, connect, verifyFetch = fetch) {
       for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
       payload = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
       if (!payload || Array.isArray(payload) || typeof payload !== "object") throw new Error();
-    } catch { return reply(400, "REJECTED", "Invalid request body."); }
+    } catch { return config.writesEnabled !== "true"
+      ? reply(503,"REJECTED","Inventory writes are disabled.") : reply(400, "REJECTED", "Invalid request body."); }
     const action = payload.action;
+    const isReceiptRead = action === "list_receipt_expirations";
+    if (!isReceiptRead && config.writesEnabled !== "true") return reply(503,"REJECTED","Inventory writes are disabled.");
     let sql, args, fields;
     const string = (value, max) => typeof value === "string" && value.length > 0 && value.length <= max;
-    if (action === "add_ingredient") {
+    if (isReceiptRead) {
+      fields = ["action","offset"];
+      if (!Number.isInteger(payload.offset) || payload.offset < 0 || payload.offset > 49500 || payload.offset % 500 !== 0)
+        return reply(400,"REJECTED","Invalid receipt page.");
+      sql = "SELECT erp_private.list_receipt_expirations($1::integer)::text AS page_json";
+      args = [payload.offset];
+    } else if (action === "add_ingredient") {
       fields = ["action","name","category","unit_id"];
       if (!string(payload.name,200) || !string(payload.category,200) || !units.has(payload.unit_id))
         return reply(400,"REJECTED","Check ingredient fields.");
       sql = "SELECT erp_private.create_ingredient($1::text,$2::text,$3::uuid)::text AS ingredient_id";
       args = [payload.name,payload.category,payload.unit_id];
+    } else if (action === "reactivate_ingredient") {
+      fields = ["action","name"];
+      if (!string(payload.name,200))
+        return reply(400,"REJECTED","Check ingredient name.");
+      sql = "SELECT erp_private.reactivate_ingredient($1::text)::text AS ingredient_id";
+      args = [payload.name];
+    } else if (action === "record_waste") {
+      fields = ["action","ingredient_id","quantity","reason"];
+      if (typeof payload.ingredient_id !== "string" || !uuid.test(payload.ingredient_id) ||
+          !string(payload.quantity,128) || !/^\d+(?:\.\d{1,2})?$/.test(payload.quantity) ||
+          !["spoiled","damaged","other"].includes(payload.reason))
+        return reply(400,"REJECTED","Check waste fields.");
+      const [whole, fraction = ""] = payload.quantity.split(".");
+      const amount = BigInt(whole) * 100n + BigInt(fraction.padEnd(2,"0"));
+      if (amount <= 0n || amount > 999999999999n) return reply(400,"REJECTED","Check waste quantity.");
+      if (!verifiedOperatorId || !users.includes(verifiedOperatorId)) return reply(403,"REJECTED","Operator not authorized.");
+      sql = "SELECT transaction_id::text,ledger_sequence_text FROM erp_private.record_waste($1::uuid,$2::text,$3::text,$4::uuid)";
+      args = [payload.ingredient_id,payload.quantity,payload.reason,verifiedOperatorId];
     } else if (action === "receive_stock" || action === "consume_stock") {
       fields = ["action","ingredient_id","quantity","date"];
       if (!uuid.test(payload.ingredient_id) || !string(payload.quantity,128) ||
@@ -75,6 +109,17 @@ export function createInventoryHandler(config, connect, verifyFetch = fetch) {
         return reply(400,"REJECTED","Check transaction fields.");
       sql = "SELECT transaction_id::text,ledger_sequence_text FROM erp_private.record_inventory_transaction($1::uuid,$2::text,$3::text,$4::date,$5::uuid)";
       args = [payload.ingredient_id,action === "receive_stock" ? "INCOMING" : "CONSUMPTION",payload.quantity,payload.date,null];
+      if (action === "receive_stock" && Object.hasOwn(payload,"expires_on")) {
+        fields = [...fields,"expires_on"];
+        if (!calendarDate(payload.date) || payload.expires_on !== null &&
+            (!calendarDate(payload.expires_on) || payload.expires_on < payload.date))
+          return reply(400,"REJECTED","Check expiration date.");
+        const [whole,fraction=""] = payload.quantity.split(".");
+        const amount = BigInt(whole)*100n+BigInt(fraction.padEnd(2,"0"));
+        if (amount<=0n || amount>999999999999n) return reply(400,"REJECTED","Check receipt quantity.");
+        sql = "SELECT transaction_id::text,ledger_sequence_text FROM erp_private.record_receipt_v1($1::uuid,$2::text,$3::date,$4::date)";
+        args = [payload.ingredient_id,payload.quantity,payload.date,payload.expires_on];
+      }
     } else if (action === "deactivate_ingredient") {
       fields = ["action","ingredient_id"];
       if (!uuid.test(payload.ingredient_id)) return reply(400,"REJECTED","Choose an ingredient.");
@@ -86,7 +131,7 @@ export function createInventoryHandler(config, connect, verifyFetch = fetch) {
     let db, began = false, committing = false;
     try {
       db = await connect();
-      await db.query("BEGIN ISOLATION LEVEL READ COMMITTED", []); began = true;
+      await db.query(isReceiptRead ? "BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY" : "BEGIN ISOLATION LEVEL READ COMMITTED", []); began = true;
       await db.query("SET LOCAL statement_timeout = '5s'", []);
       const identity = await db.query("SELECT session_user::text AS session_identity,current_user::text AS effective_identity", []);
       if (identity.rows.length !== 1 || identity.rows[0].session_identity !== "erp_admin_caller" ||
@@ -94,7 +139,14 @@ export function createInventoryHandler(config, connect, verifyFetch = fetch) {
       const output = await db.query(sql,args);
       if (output.rows.length !== 1) throw new Error("Unexpected result count.");
       let result = {};
-      if (action === "add_ingredient") {
+      if (isReceiptRead) {
+        const page = JSON.parse(output.rows[0].page_json);
+        if (!page || typeof page.total !== "string" || !/^\d+$/.test(page.total) || Number(page.total)>50000 ||
+            !Array.isArray(page.rows) || page.rows.length>500) throw new Error("Invalid receipt page result.");
+        result = { total: page.total, rows: page.rows.map(item => ({ receipt_id:item.receipt_id,
+          ingredient_id:item.ingredient_id,ingredient_name:item.ingredient_name,original_quantity:item.original_quantity,
+          unit_code:item.unit_code,transaction_date:item.transaction_date,expires_on:item.expires_on,ledger_sequence:item.ledger_sequence })) };
+      } else if (action === "add_ingredient" || action === "reactivate_ingredient") {
         if (!uuid.test(output.rows[0].ingredient_id)) throw new Error("Invalid return.");
         result = { ingredient_id: output.rows[0].ingredient_id };
       } else if (action !== "deactivate_ingredient") {
@@ -104,13 +156,20 @@ export function createInventoryHandler(config, connect, verifyFetch = fetch) {
       }
       committing = true;
       await db.query("COMMIT", []);
-      return reply(200,"COMMITTED","Inventory change confirmed.",result);
+      return isReceiptRead ? reply(200,"READ","Receipt expiration page loaded.",result)
+        : reply(200,"COMMITTED","Inventory change confirmed.",result);
     } catch (error) {
       let rolledBack = false;
       if (db && began) { try { await db.query("ROLLBACK", []); rolledBack = true; } catch { /* Outcome stays unknown. */ } }
+      if (isReceiptRead) return reply(503,"REJECTED","Expiration records unavailable.");
       if (committing || !rolledBack && began) return reply(503,"UNKNOWN","Outcome unknown. Reconcile before retry.");
       if (!began) return reply(503,"REJECTED","Write connection unavailable.");
-      const business = ["22023","23514","23505","22007","22008"].includes(error?.code);
+      const reactivationErrors = { P3401: "Ingredient not found.", P3402: "Ingredient is already active.",
+        P3403: "Inactive ingredient has nonzero stock. Reactivation rejected." };
+      const reactivationMessage = action === "reactivate_ingredient" &&
+        Object.hasOwn(reactivationErrors, error?.code) ? reactivationErrors[error.code] : null;
+      const business = !!reactivationMessage || ["22023","23514","23505","22007","22008"].includes(error?.code);
+      if (reactivationMessage) return reply(409,"ROLLED_BACK",reactivationMessage);
       return reply(business ? 409 : 503,"ROLLED_BACK",business ? "Change violates an inventory rule." : "Write failed and was rolled back.");
     } finally { if (db) { try { await db.close(); } catch { /* Never leak connection details. */ } } }
   };

@@ -26,6 +26,39 @@ function request(body: unknown = payloads[3], overrides: Record<string, string> 
     headers: { origin, authorization: "Bearer synthetic.token", "content-type": "application/json", ...overrides },
     ...(method === "POST" ? { body: JSON.stringify(body) } : {}) });
 }
+
+// Edge validation parity only: the mocked database does not execute PostgreSQL.
+for (const name of ["Potato", "POTATO", "  Potato  ", "Pot\tato", "Pot\nato",
+  "Pot\rato", "Pot\u000bato", "Pot\u000cato", "Pot\u001bato", "Pot\u007fato",
+  "\u00a0Potato\u00a0", "\u00a0", " \t\r\n ", "x".repeat(200), "\u{1f954}".repeat(100)]) {
+  Deno.test("reactivation forwards Add-compatible name: " + JSON.stringify(name), async () => {
+    const add = harness();
+    equal((await add.handler(request({ ...payloads[0], name }))).status, 200);
+    const h = harness();
+    const response = await h.handler(request({ action: "reactivate_ingredient", name }));
+    equal(response.status, 200);
+    equal((await response.json()).result.ingredient_id, ingredient);
+    const call = h.state.statements.find(item => item.text.includes("erp_private.reactivate_ingredient("));
+    equal(call?.text, "SELECT erp_private.reactivate_ingredient($1::text)::text AS ingredient_id");
+    equal(call?.args, [name]);
+  });
+}
+for (const name of ["", null, 42, "x".repeat(201), "\u{1f954}".repeat(101)]) {
+  Deno.test("reactivation rejects invalid Edge name: " + JSON.stringify(name), async () => {
+    for (const body of [{ ...payloads[0], name }, { action: "reactivate_ingredient", name }]) {
+      const h = harness();
+      equal((await h.handler(request(body))).status, 400);
+      noDatabase(h.state);
+    }
+  });
+}
+// Whitespace passes Add's Edge check; SQL is responsible for trimmed-empty rejection.
+Deno.test("reactivation propagates mocked SQL name rejection without success", async () => {
+  const h = harness({ businessFailure: true });
+  const response = await h.handler(request({ action: "reactivate_ingredient", name: " \t\r\n " }));
+  equal(response.status, 409);
+  equal((await response.json()).outcome, "ROLLED_BACK");
+});
 function harness(options: Record<string, any> = {}) {
   const state = { connected: 0, reserved: 0, released: 0, ended: 0,
     auth: 0, configReads: 0, statements: [] as { text: string; args: any[] }[], driverOptions: null as any };
@@ -42,9 +75,10 @@ function harness(options: Record<string, any> = {}) {
             if (text === "COMMIT" && options.commitFailure) throw new Error("fake-only commit failure");
             if (text === "ROLLBACK" && options.rollbackFailure) throw new Error("fake-only rollback failure");
             if (text.includes("erp_private.")) {
-              if (options.businessFailure) throw Object.assign(new Error("fake-only internal query/token/password"), { code: "23514" });
-              if (text.includes("create_ingredient")) return [{ ingredient_id: ingredient }];
-              if (text.includes("record_inventory_transaction")) return [{ transaction_id: ingredient,
+              if (options.businessFailure) throw Object.assign(new Error("fake-only internal query/token/password"), { code: options.businessCode || "23514" });
+              if (text.includes("list_receipt_expirations")) return [{ page_json: JSON.stringify(options.receiptPage || { total: "0", rows: [] }) }];
+              if (text.includes("create_ingredient") || text.includes("reactivate_ingredient")) return [{ ingredient_id: ingredient }];
+              if (text.includes("record_inventory_transaction") || text.includes("record_waste") || text.includes("record_receipt_v1")) return [{ transaction_id: ingredient,
                 ledger_sequence_text: options.numericSequence ? 9007199254740992 : "9007199254740993" }];
               return [{}];
             }
@@ -75,6 +109,116 @@ function harness(options: Record<string, any> = {}) {
 }
 function noDatabase(state) {
   equal(state.configReads, 0); equal(state.connected, 0); equal(state.statements, []);
+}
+const wastePayload = { action: "record_waste", ingredient_id: ingredient, quantity: "1.25", reason: "spoiled" };
+const expiryReceipt = { ...payloads[1], expires_on: "2026-01-09" };
+for (const expires_on of ["2026-01-09", "2026-01-02", null]) {
+  Deno.test("Expiry E02 E03 E21 E22 atomic routing: " + expires_on, async () => {
+    const h = harness(); const response = await h.handler(request({ ...expiryReceipt, expires_on }));
+    equal(response.status,200); equal((await response.json()).outcome,"COMMITTED");
+    const calls=h.state.statements.filter(s=>s.text.includes("erp_private."));
+    equal(calls.length,1);assert(calls[0].text.includes("record_receipt_v1"));
+    equal(calls[0].args,[ingredient,"12.50","2026-01-02",expires_on]);
+  });
+}
+for (const patch of [{ expires_on:"2026-02-30" },{ expires_on:"2026-01-01" },{ expires_on:"infinity" },
+  { expires_on:"2026-01-09T00:00:00Z" },{ ingredient_id:"bad" },{ quantity:"0" },{ quantity:"-1" },
+  { quantity:"1.001" },{ quantity:"10000000000" },{ recorded_by:operator }]) {
+  Deno.test("Expiry E04-E08 invalid input: " + JSON.stringify(patch), async () => {
+    const h=harness();equal((await h.handler(request({...expiryReceipt,...patch}))).status,400);noDatabase(h.state);
+  });
+}
+for (const offset of [0,500,49500]) {
+  Deno.test("Expiry E14 E17 protected read with writes disabled: " + offset, async () => {
+    const h=harness({config:{writesEnabled:"false"}});
+    const response=await h.handler(request({action:"list_receipt_expirations",offset}));
+    equal(response.status,200);equal((await response.json()).outcome,"READ");
+    equal(h.state.statements[0].text,"BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY");
+    equal(h.state.statements[3].args,[offset]);
+    assert(h.state.statements[3].text.includes("list_receipt_expirations"));
+  });
+}
+for (const offset of [-1,1,50000,"0",null,0.5]) {
+  Deno.test("Expiry E18 rejects page: " + JSON.stringify(offset), async () => {
+    const h=harness({config:{writesEnabled:"false"}});
+    equal((await h.handler(request({action:"list_receipt_expirations",offset}))).status,400);noDatabase(h.state);
+  });
+}
+for (const [name,options,status,outcome] of [
+  ["E09 fractional each",{businessFailure:true,businessCode:"22023"},409,"ROLLED_BACK"],
+  ["E10 disabled receipt",{config:{writesEnabled:"false"}},503,"REJECTED"],
+  ["E11 auth",{authFailure:true},401,"REJECTED"],
+  ["E12 operator",{user:ingredient},403,"REJECTED"],
+  ["E19 SQL",{businessFailure:true,businessCode:"XX000"},503,"ROLLED_BACK"],
+  ["E20 ambiguity",{commitFailure:true},503,"UNKNOWN"]
+] as const) {
+  Deno.test("Expiry receipt boundary " + name, async () => {
+    const h=harness(options);const response=await h.handler(request(expiryReceipt));
+    equal(response.status,status);equal((await response.json()).outcome,outcome);
+  });
+}
+for (const [name,options,status] of [
+  ["E13 Auth",{authFailure:true},401],["E15 operator",{user:ingredient},403],
+  ["E16 caller",{identity:"postgres"},503],["E19 read SQL",{businessFailure:true},503],
+  ["read COMMIT failure",{commitFailure:true},503]
+] as const) {
+  Deno.test("Expiry read boundary " + name, async () => {
+    const h=harness({...options,config:{writesEnabled:"false"}});
+    const response=await h.handler(request({action:"list_receipt_expirations",offset:0}));
+    equal(response.status,status);assert((await response.json()).outcome!=="UNKNOWN");
+    if(status===401||status===403)noDatabase(h.state);
+  });
+}
+Deno.test("Expiry read strips accidental private fields",async()=>{
+  const h=harness({receiptPage:{total:"1",rows:[{receipt_id:ingredient,recorded_by:operator,email:"private@example.invalid"}]}});
+  const body=await (await h.handler(request({action:"list_receipt_expirations",offset:0}))).json();
+  assert(!JSON.stringify(body).includes(operator));assert(!JSON.stringify(body).includes("private@example.invalid"));
+});
+for (const reason of ["spoiled", "damaged", "other"]) {
+  Deno.test("E01 E02 E21 E23 E24 waste dispatch: " + reason, async () => {
+    const h = harness(); const response = await h.handler(request({ ...wastePayload, reason }));
+    equal(response.status,200); const data = await response.json();
+    equal(data.result.transaction_id,ingredient); equal(data.result.ledger_sequence_text,"9007199254740993");
+    const calls = h.state.statements.filter(s => s.text.includes("erp_private."));
+    equal(calls.length,1);
+    equal(calls[0].text,"SELECT transaction_id::text,ledger_sequence_text FROM erp_private.record_waste($1::uuid,$2::text,$3::text,$4::uuid)");
+    equal(calls[0].args,[ingredient,"1.25",reason,operator]);
+  });
+}
+for (const [name, patch] of [
+  ["E03 invalid reason", { reason: "Spoiled" }], ["E04 missing reason", { reason: undefined }],
+  ["E05 zero", { quantity: "0.00" }], ["E06 negative", { quantity: "-1" }],
+  ["E07 maximum", { quantity: "10000000000" }], ["E08 precision", { quantity: "1.001" }],
+  ["E09 missing ingredient", { ingredient_id: undefined }], ["E10 malformed UUID", { ingredient_id: "bad" }],
+  ["E11 actor", { recorded_by: operator }], ["E11 user", { user_id: operator }],
+  ["E12 date", { date: "2026-01-01" }], ["E12 timestamp", { timestamp: "2026-01-01" }],
+  ["E13 unit", { unit: "lb" }], ["E13 supplier", { supplier_id: ingredient }],
+  ["missing quantity", { quantity: undefined }], ["numeric quantity", { quantity: 1 }],
+  ["Infinity", { quantity: "Infinity" }], ["unknown action", { action: "waste_sql" }]
+] as const) {
+  Deno.test("Waste input " + name, async () => {
+    const h = harness(); equal((await h.handler(request({ ...wastePayload, ...patch }))).status,400); noDatabase(h.state);
+  });
+}
+for (const [name, options, status, outcome] of [
+  ["E14 unauthenticated", { authFailure: true },401,"REJECTED"],
+  ["E15 non-operator", { user: ingredient },403,"REJECTED"],
+  ["E16 disabled", { config: { writesEnabled: "false" } },503,"REJECTED"],
+  ["E17 database error", { businessFailure: true, businessCode: "XX000" },503,"ROLLED_BACK"],
+  ["E18 insufficient", { businessFailure: true },409,"ROLLED_BACK"],
+  ["E19 inactive", { businessFailure: true, businessCode: "22023" },409,"ROLLED_BACK"],
+  ["unknown ingredient", { businessFailure: true, businessCode: "22023" },409,"ROLLED_BACK"],
+  ["fractional each", { businessFailure: true, businessCode: "22023" },409,"ROLLED_BACK"],
+  ["E20 ambiguous commit", { commitFailure: true },503,"UNKNOWN"],
+  ["E22 identity", { identity: "postgres" },503,"ROLLED_BACK"]
+] as const) {
+  Deno.test("Waste boundary " + name, async () => {
+    const h = harness(options); const response = await h.handler(request(wastePayload));
+    equal(response.status,status); equal((await response.json()).outcome,outcome);
+    if ([401,403].includes(status) || name === "E16 disabled") noDatabase(h.state);
+    if (name === "E22 identity") assert(!h.state.statements.some(s => s.text.includes("record_waste")));
+    if (name === "E20 ambiguous commit") equal(h.state.statements.filter(s => s.text.includes("record_waste")).length,1);
+  });
 }
 Deno.test("missing token rejected before database", async () => {
   const h = harness(); equal((await h.handler(request(payloads[3], { authorization: "" }))).status, 401); noDatabase(h.state);

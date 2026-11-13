@@ -10,3 +10,17 @@ fieldset { border: 1px solid #dce4e9; border-radius: 8px; padding: 18px; margin-
 fieldset:disabled { opacity: .65; }
 #sign-in { max-width: 420px; }
 #sign-out { width: auto; }
+[hidden] { display: none !important; }
+#login-screen, #restaurant-screen { max-width: 560px; margin-inline: auto; }
+#signed-in-controls { margin-bottom: 24px; }
+#signed-in-controls button { margin-top: 0; }
+#dashboard-title { margin-bottom: 24px; }
+.stock-low { color: #805100; background: #fff7df; font-weight: 700; }
+#stock-summary { font-weight: 650; }
+#stock-overview th, #stock-overview td { white-space: nowrap; }
+#stock-alert-body input { width: 180px; }
+#save-thresholds, #reset-thresholds { width: auto; margin-right: 12px; }
+#threshold-message { min-height: 1.6em; }
+#stock-alert-body input[aria-invalid="true"] { border-color: #a12525; }
+#refresh-expirations { width: auto; margin: 0 0 20px; }
+#expiration-overview th, #expiration-overview td { white-space: nowrap; }

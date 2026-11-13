@@ -16,13 +16,324 @@
     typeof config.publishableKey === "string" && /^sb_publishable_[A-Za-z0-9_-]+$/.test(config.publishableKey);
   let loading = false;
   let inventoryOptions = [];
+  let historyRows = [];
   let writeBusy = false;
   let accessToken = null;
+  let thresholdUserId = null;
+  let thresholdOverrides = new Map();
+  let thresholdNotice = "";
   let expiresAt = 0;
   let unknownWrite = false;
   let authorizationDenied = false;
   let expiryTimer = null;
   const writesAvailable = available && config.writeEnabled === true;
+  let appState = "LOGGED_OUT";
+  let restaurantSelected = false;
+  let readGeneration = 0;
+  let activeReadController = null;
+  let expirationRows = null;
+  let expirationController = null;
+  let expirationPromise = null;
+
+  function expirationStatus(expiresOn, today) {
+    if (!validBusinessDate(today) || expiresOn !== null && !validBusinessDate(expiresOn)) return "Unavailable";
+    if (expiresOn === null) return "Not Configured";
+    if (expiresOn < today) return "Expired";
+    if (expiresOn === today) return "Expires Today";
+    const [y,m,d] = today.split("-").map(Number);
+    const horizon = new Date(0);
+    horizon.setUTCFullYear(y,m-1,d);
+    horizon.setUTCHours(0,0,0,0);
+    horizon.setUTCDate(horizon.getUTCDate()+7);
+    return expiresOn <= horizon.toISOString().slice(0,10) ? "Expiring Soon" : "Normal";
+  }
+
+  function clearExpirations(message) {
+    expirationRows = null;
+    element("expiration-summary").textContent = "Unavailable — " + message;
+    element("expiration-body").replaceChildren();
+    row(element("expiration-body"), ["Unavailable"], 7);
+  }
+
+  function renderExpirations() {
+    if (!canReadInventory() || expirationRows === null) return;
+    const today = new Date(Date.now()).toISOString().slice(0,10);
+    const statuses = expirationRows.map(item => expirationStatus(item.expires_on,today));
+    element("expiration-summary").textContent = "UTC reference date: " + today +
+      " · Expired receipt records: " + statuses.filter(s=>s==="Expired").length +
+      " · Expires Today: " + statuses.filter(s=>s==="Expires Today").length +
+      " · Expiring-soon receipt records: " + statuses.filter(s=>s==="Expiring Soon").length +
+      " · Unknown-expiry receipt records: " + statuses.filter(s=>s==="Not Configured").length;
+    element("expiration-body").replaceChildren();
+    expirationRows.forEach((item,index) => {
+      row(element("expiration-body"), [item.receipt_id.slice(0,8)+"…",item.ingredient_name,
+        decimal(item.original_quantity,true),item.unit_code,item.transaction_date,item.expires_on ?? "Not Configured",statuses[index]]);
+      element("expiration-body").lastElementChild.firstElementChild.title = item.receipt_id;
+    });
+    if (!expirationRows.length) row(element("expiration-body"), ["No receipt records available."], 7);
+  }
+
+  function loadExpirations() {
+    checkSessionExpiry();
+    if (!canReadInventory()) return Promise.resolve();
+    if (expirationPromise) return expirationPromise;
+    const generation = readGeneration, controller = new AbortController(), token = accessToken;
+    expirationController = controller;
+    const current = () => generation===readGeneration && canReadInventory() && token===accessToken;
+    const pending = (async () => {
+      clearExpirations("loading protected receipt records.");
+      element("refresh-expirations").disabled = true;
+      const timer = setTimeout(()=>controller.abort(),20000);
+      const receipts=[], ids=new Set(), sequences=new Set();
+      let total=null, previous=0n;
+      try {
+        for (let page=0; page<100; page++) {
+          if (!current() || controller.signal.aborted) return;
+          const response = await fetch(projectUrl+"/functions/v1/inventory-write", {
+            method:"POST",credentials:"omit",cache:"no-store",redirect:"error",signal:controller.signal,
+            headers:{apikey:config.publishableKey,Authorization:"Bearer "+token,"Content-Type":"application/json"},
+            body:JSON.stringify({action:"list_receipt_expirations",offset:receipts.length})
+          });
+          if (!current()) return;
+          if (response.status===401) { clearSession("Your session was rejected. Sign in again."); return; }
+          if (response.status!==200) throw new Error();
+          if (!/^application\/json(?:;|$)/i.test(response.headers.get("content-type") || "")) throw new Error();
+          const data=decodeExactJson(await response.text());
+          if (!current()) return;
+          const result=data?.result;
+          if (data?.ok!==true || data.outcome!=="READ" || typeof result?.total!=="string" || !/^\d+$/.test(result.total) ||
+              Number(result.total)>50000 || !Array.isArray(result.rows)) throw new Error();
+          const count=Number(result.total);
+          if (total!==null && total!==count || result.rows.length!==Math.min(500,count-receipts.length)) throw new Error();
+          total=count;
+          for (const item of result.rows) {
+            const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+            if (!uuid.test(item.receipt_id) || !uuid.test(item.ingredient_id) || ids.has(item.receipt_id) ||
+                typeof item.ledger_sequence!=="string" || !/^[1-9]\d*$/.test(item.ledger_sequence) ||
+                sequences.has(item.ledger_sequence) || BigInt(item.ledger_sequence)<=previous ||
+                !["lb","pt","fl oz","each"].includes(item.unit_code) || !validBusinessDate(item.transaction_date) ||
+                item.expires_on!==null && (!validBusinessDate(item.expires_on) || item.expires_on<item.transaction_date)) throw new Error();
+            text(item.ingredient_name);
+            const quantity=stockHundredths(item.original_quantity,item.unit_code);
+            if (quantity===null || quantity<=0n || quantity>999999999999n) throw new Error();
+            ids.add(item.receipt_id);sequences.add(item.ledger_sequence);previous=BigInt(item.ledger_sequence);
+            receipts.push(item);
+          }
+          if (receipts.length===total) {
+            if (current()) { expirationRows=receipts;renderExpirations(); }
+            return;
+          }
+        }
+        throw new Error();
+      } catch {
+        if (current()) clearExpirations("protected receipt records could not be loaded or validated. Inventory remains separate.");
+      } finally {
+        clearTimeout(timer);
+        if (current()) { expirationController=null;element("refresh-expirations").disabled=false; }
+      }
+    })().finally(()=>{if(expirationPromise===pending) expirationPromise=null;});
+    expirationPromise=pending;
+    return pending;
+  }
+  // Read-only demo values in the seed ingredients' units, not production policy.
+  // Names/units bootstrap UUID bindings; all subsequent lookups use ingredient_id.
+  const demoThresholdTemplates = Object.freeze([
+    { name: "Beef", unit: "lb", quantity: "5.00" },
+    { name: "Chicken", unit: "lb", quantity: "10.00" },
+    { name: "Salmon", unit: "lb", quantity: "4.00" },
+    { name: "Milk", unit: "pt", quantity: "3.00" },
+    { name: "Cooking Oil", unit: "fl oz", quantity: "16.00" },
+    { name: "Eggs", unit: "each", quantity: "20" }
+  ].map(Object.freeze));
+  const demoThresholdsById = new Map();
+
+  function thresholdKey(item) { return item.ingredient_id + "|" + item.unit_code; }
+  function thresholdStorageKey() {
+    return thresholdUserId ? "gateway.thresholds.v1:" + projectUrl + ":gateway-demo:" + thresholdUserId : null;
+  }
+  function validThreshold(value, unit) {
+    return value === null || typeof value === "string" && value.length <= 128 && stockHundredths(value, unit) !== null;
+  }
+  function loadThresholdSettings() {
+    thresholdOverrides = new Map();
+    thresholdNotice = "";
+    const key = thresholdStorageKey();
+    if (!key) {
+      thresholdNotice = "User identity unavailable. Threshold changes can only be applied for this session.";
+      return;
+    }
+    try {
+      const source = localStorage.getItem(key);
+      if (source === null) return;
+      if (source.length > 2000000) throw new Error();
+      const data = JSON.parse(source);
+      if (data?.version !== 1 || !Array.isArray(data.entries) || data.entries.length > 50000) throw new Error();
+      const loaded = new Map();
+      for (const entry of data.entries) {
+        if (!entry || typeof entry.ingredient_id !== "string" ||
+            !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(entry.ingredient_id) ||
+            !["lb", "pt", "fl oz", "each"].includes(entry.unit_code) ||
+            !validThreshold(entry.value, entry.unit_code) || loaded.has(thresholdKey(entry))) throw new Error();
+        loaded.set(thresholdKey(entry), { ingredient_id: entry.ingredient_id, unit_code: entry.unit_code, value: entry.value });
+      }
+      thresholdOverrides = loaded;
+    } catch {
+      thresholdNotice = "Saved thresholds could not be read or were invalid. Demo defaults are shown; nothing was overwritten.";
+    }
+  }
+
+  function saveThresholdSettings(reset = false) {
+    checkSessionExpiry();
+    if (!canReadInventory() || loading || element(reset ? "reset-thresholds" : "save-thresholds").disabled) return;
+    const next = reset ? new Map() : new Map(thresholdOverrides);
+    if (!reset) {
+      for (const item of inventoryOptions) {
+        const input = element("threshold-" + item.ingredient_id);
+        const value = input.value;
+        if (value !== "" && !validThreshold(value, item.unit_code)) {
+          input.setAttribute("aria-invalid", "true");
+          input.focus();
+          element("threshold-message").textContent = "Invalid threshold for " + item.ingredient_name +
+            ": use a nonnegative decimal with up to two decimal places (whole numbers for each). Nothing was saved.";
+          return;
+        }
+        input.removeAttribute("aria-invalid");
+        next.set(thresholdKey(item), { ingredient_id: item.ingredient_id, unit_code: item.unit_code,
+          value: value === "" ? null : value });
+      }
+    }
+    const key = thresholdStorageKey();
+    if (key) {
+      try {
+        const source = JSON.stringify({ version: 1, entries: [...next.values()] });
+        if (source.length > 2000000) throw new Error();
+        localStorage.setItem(key, source);
+      } catch {
+        element("threshold-message").textContent = "Thresholds could not be saved to this browser. Previous settings remain active; drafts were not saved.";
+        return;
+      }
+    }
+    thresholdOverrides = next;
+    if (reset) demoThresholdsById.clear();
+    thresholdNotice = key ? (reset ? "Reset to demo defaults in this browser." : "Thresholds saved in this browser only.")
+      : "Thresholds applied for this session only. User identity unavailable; nothing was persisted.";
+    renderStockAlerts(inventoryOptions);
+  }
+
+  function stockHundredths(value, unit) {
+    if (typeof value !== "string" || !/^\d+(?:\.\d{1,2})?$/.test(value)) return null;
+    const [whole, fraction = ""] = value.split(".");
+    const amount = BigInt(whole) * 100n + BigInt(fraction.padEnd(2, "0"));
+    return unit === "each" && amount % 100n !== 0n ? null : amount;
+  }
+
+  function stockAlert(item, threshold) {
+    const amount = stockHundredths(item.current_balance, item.unit_code);
+    if (amount === null) return { status: "Unavailable", threshold: "Unavailable" };
+    const limit = threshold && threshold.unit === item.unit_code
+      ? stockHundredths(threshold.quantity, item.unit_code) : null;
+    if (limit === null) return { status: "Not Configured", threshold: "Not Configured" };
+    return { status: amount <= limit ? "Low Stock" : "Normal",
+      threshold: decimal(threshold.quantity) };
+  }
+
+  function clearStockAlerts(message) {
+    element("save-thresholds").disabled = true;
+    element("reset-thresholds").disabled = true;
+    element("threshold-message").textContent = "";
+    element("stock-summary").textContent = "Unavailable — " + message;
+    element("stock-alert-body").replaceChildren();
+    row(element("stock-alert-body"), ["Unavailable"], 5);
+  }
+
+  function renderStockAlerts(inventory) {
+    if (!canReadInventory()) return;
+    const alerts = inventory.map(item => {
+      if (!demoThresholdsById.has(item.ingredient_id)) {
+        const template = demoThresholdTemplates.find(t => t.name === item.ingredient_name && t.unit === item.unit_code);
+        if (template) demoThresholdsById.set(item.ingredient_id, template);
+      }
+      const override = thresholdOverrides.get(thresholdKey(item));
+      const threshold = override ? (override.value === null ? null : { unit: item.unit_code, quantity: override.value })
+        : demoThresholdsById.get(item.ingredient_id);
+      return { item, draft: threshold?.quantity ?? "", ...stockAlert(item, threshold) };
+    });
+    if (alerts.some(alert => alert.status === "Unavailable")) {
+      clearStockAlerts("inventory quantities could not be validated.");
+      return;
+    }
+    element("stock-summary").textContent = "Active Ingredients: " + alerts.length +
+      " · Low Stock: " + alerts.filter(a => a.status === "Low Stock").length +
+      " · Thresholds Not Configured: " + alerts.filter(a => a.status === "Not Configured").length;
+    element("stock-alert-body").replaceChildren();
+    for (const alert of alerts) {
+      row(element("stock-alert-body"), [alert.item.ingredient_name, decimal(alert.item.current_balance),
+        alert.item.unit_code, alert.threshold, alert.status]);
+      const cell = element("stock-alert-body").lastElementChild.children[3];
+      const input = document.createElement("input");
+      input.id = "threshold-" + alert.item.ingredient_id;
+      input.type = "text";
+      input.inputMode = "decimal";
+      input.maxLength = 128;
+      input.value = alert.draft;
+      input.placeholder = "Not Configured";
+      input.setAttribute("aria-label", "Low stock threshold for " + alert.item.ingredient_name + " in " + alert.item.unit_code);
+      cell.replaceChildren(input);
+      if (alert.status === "Low Stock") element("stock-alert-body").lastElementChild.lastElementChild.classList.add("stock-low");
+    }
+    if (!alerts.length) row(element("stock-alert-body"), ["No active ingredients available."], 5);
+    element("save-thresholds").disabled = !alerts.length;
+    element("reset-thresholds").disabled = false;
+    element("threshold-message").textContent = thresholdNotice;
+  }
+
+  function canReadInventory() {
+    return available && !!accessToken && Date.now() < expiresAt &&
+      restaurantSelected && appState === "DASHBOARD";
+  }
+
+  function showScreen(state, focus = true) {
+    appState = state;
+    element("login-screen").hidden = state !== "LOGGED_OUT";
+    element("restaurant-screen").hidden = state !== "RESTAURANT_SELECTION";
+    element("dashboard-screen").hidden = state !== "DASHBOARD";
+    element("signed-in-controls").hidden = state === "LOGGED_OUT";
+    if (focus) element(state === "DASHBOARD" ? "dashboard-title" :
+      state === "RESTAURANT_SELECTION" ? "restaurant-title" : "login-title").focus();
+  }
+
+  function clearBusinessData() {
+    readGeneration++;
+    expirationController?.abort();
+    expirationController=null;
+    expirationPromise=null;
+    clearExpirations("sign in and select the demo restaurant.");
+    element("refresh-expirations").disabled=true;
+    activeReadController?.abort();
+    activeReadController = null;
+    readPromise = null;
+    loading = false;
+    inventoryOptions = [];
+    demoThresholdsById.clear();
+    thresholdOverrides.clear();
+    thresholdNotice = "";
+    thresholdUserId = null;
+    clearStockAlerts("sign in and select the demo restaurant.");
+    resetHistoryFilter();
+    updateIngredientOptions();
+    clearTables("Sign in and select the demo restaurant to load inventory.");
+    for (const id of ["add-ingredient", "receive-stock", "consume-stock", "deactivate-ingredient", "reactivate-ingredient", "record-waste"]) element(id).reset();
+    element("record-waste").hidden = true;
+    element("toggle-waste").setAttribute("aria-expanded", "false");
+    updateWasteUnit();
+    element("write-message").textContent = "";
+    element("connection-status").textContent = "Not Connected";
+    element("connection-detail").textContent = "No inventory loaded.";
+    element("connection-error").textContent = "";
+    element("connection-error").hidden = true;
+    refresh.disabled = true;
+    for (const id of ["stock-section", "history-section"]) element(id).setAttribute("aria-busy", "false");
+  }
 
   function row(body, values, span) {
     const entry = document.createElement("tr");
@@ -36,11 +347,46 @@
   }
 
   function clearTables(message) {
-    for (const [id, span] of [["stock-body", 4], ["history-body", 6]]) {
+    for (const [id, span] of [["stock-body", 4], ["history-body", 7]]) {
       const body = element(id);
       body.replaceChildren();
       row(body, [message], span);
     }
+  }
+
+  function resetHistoryFilter() {
+    historyRows = [];
+    const select = element("history-ingredient");
+    select.replaceChildren();
+    const all = document.createElement("option");
+    all.value = "";
+    all.textContent = "All Ingredients";
+    select.appendChild(all);
+    select.value = "";
+    select.disabled = true;
+  }
+
+  function populateHistoryFilter(inventory, selected) {
+    const select = element("history-ingredient");
+    const names = new Set([...inventory.map(item => item[0]), ...historyRows.map(item => item.cells[1])]);
+    for (const name of [...names].sort()) {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      select.appendChild(option);
+    }
+    select.value = names.has(selected) ? selected : "";
+    select.disabled = false;
+  }
+
+  function renderHistory() {
+    if (!canReadInventory() || loading) return;
+    const selected = element("history-ingredient").value;
+    const filtered = historyRows.filter(item => !selected || item.cells[1] === selected);
+    element("history-body").replaceChildren();
+    for (const item of filtered) row(element("history-body"), item.cells);
+    if (!filtered.length) row(element("history-body"), [selected
+      ? "No transactions recorded for this ingredient." : "No inventory transactions recorded."], 7);
   }
 
   function text(value) {
@@ -70,10 +416,14 @@
       const sequence = text(item.ledger_sequence);
       if (!/^[1-9]\d*$/.test(sequence) || sequences.has(sequence)) throw new Error("Invalid ledger sequence.");
       sequences.add(sequence);
-      if (!["INCOMING", "CONSUMPTION"].includes(item.transaction_type)) throw new Error("Invalid transaction type.");
+      if (!["INCOMING", "CONSUMPTION", "WASTE"].includes(item.transaction_type)) throw new Error("Invalid transaction type.");
+      const reasons = { spoiled: "Spoiled", damaged: "Damaged", other: "Other" };
+      if (item.transaction_type === "WASTE" ? !Object.hasOwn(reasons, item.waste_reason)
+          : item.waste_reason !== null && item.waste_reason !== undefined) throw new Error("Invalid waste reason.");
       return { sequence, cells: [sequence, text(item.ingredient_name),
-        item.transaction_type === "INCOMING" ? "Incoming stock" : "Consumption",
-        decimal(item.quantity, true), text(item.unit_code), text(item.transaction_date)] };
+        item.transaction_type === "INCOMING" ? "Incoming stock" : item.transaction_type === "WASTE" ? "Waste" : "Consumption",
+        decimal(item.quantity, true), text(item.unit_code), text(item.transaction_date),
+        item.transaction_type === "WASTE" ? reasons[item.waste_reason] : "—"] };
     });
     history.sort((a, b) => BigInt(a.sequence) < BigInt(b.sequence) ? -1 : BigInt(a.sequence) > BigInt(b.sequence) ? 1 : 0);
     return { inventory, history };
@@ -137,10 +487,12 @@
     return decoded;
   }
 
-  async function readView(view, columns, order, signal) {
+  async function readView(view, columns, order, signal, generation) {
+    const current = () => generation === readGeneration && canReadInventory() && !signal.aborted;
     const all = [];
     let total = null;
     for (let page = 0; page < 100; page++) {
+      if (!current()) throw new Error("Inventory read cancelled.");
       const url = new URL(projectUrl + "/rest/v1/" + view);
       url.search = new URLSearchParams({ select: columns, order, limit: "500", offset: String(all.length) }).toString();
       const response = await fetch(url, {
@@ -148,9 +500,12 @@
         headers: { apikey: config.publishableKey, "Accept-Profile": "erp_api",
           Accept: "application/json", Prefer: "count=exact" }
       });
+      if (!current()) throw new Error("Inventory read cancelled.");
       if (!response.ok || ![200, 206].includes(response.status)) throw new Error("Read failed.");
       if (!/^application\/json(?:;|$)/i.test(response.headers.get("content-type") || "")) throw new Error("Invalid response type.");
-      const rows = decodeExactJson(await response.text());
+      const source = await response.text();
+      if (!current()) throw new Error("Inventory read cancelled.");
+      const rows = decodeExactJson(source);
       if (!Array.isArray(rows) || rows.length > 500) throw new Error("Invalid page.");
       const range = response.headers.get("content-range") || "";
       if (range === "*/0" && all.length === 0 && rows.length === 0) return [];
@@ -167,13 +522,12 @@
     throw new Error("Inventory exceeds the supported read limit.");
   }
 
-  async function readInventory() {
-    const controller = new AbortController();
+  async function readInventory(controller, generation) {
     const timeout = setTimeout(() => controller.abort(), 20000);
     try {
       const [inventory, history] = await Promise.all([
-        readView("inventory_balances", "ingredient_id,ingredient_name,category,unit_code,current_balance", "ingredient_id.asc", controller.signal),
-        readView("inventory_history", "ledger_sequence,ingredient_name,transaction_type,quantity,unit_code,transaction_date,created_at", "ledger_sequence.asc", controller.signal)
+        readView("inventory_balances", "ingredient_id,ingredient_name,category,unit_code,current_balance", "ingredient_id.asc", controller.signal, generation),
+        readView("inventory_history", "*", "ledger_sequence.asc", controller.signal, generation)
       ]);
       return { inventory, history };
     } finally {
@@ -184,15 +538,26 @@
 
   let readPromise = null;
   function load() {
-    if (!available) return Promise.resolve();
-    if (!readPromise) readPromise = loadNow().finally(() => { readPromise = null; });
+    checkSessionExpiry();
+    if (!canReadInventory()) return Promise.resolve();
+    if (!readPromise) {
+      const pending = loadNow().finally(() => { if (readPromise === pending) readPromise = null; });
+      readPromise = pending;
+    }
     return readPromise;
   }
 
   async function loadNow() {
-    if (!available || loading) return;
+    if (!canReadInventory() || loading) return;
+    const generation = readGeneration;
+    const controller = new AbortController();
+    activeReadController = controller;
+    const current = () => generation === readGeneration && canReadInventory();
     loading = true;
+    const selectedHistory = element("history-ingredient").value;
+    resetHistoryFilter();
     refresh.disabled = true;
+    clearStockAlerts("inventory is loading.");
     element("connection-error").hidden = true;
     element("connection-status").textContent = "Loading · Data source: Connection pending";
     element("connection-detail").textContent = "Loading current inventory and history from Supabase.";
@@ -201,34 +566,41 @@
     updateIngredientOptions();
     clearTables("Loading…");
     try {
-      const raw = await readInventory();
+      const raw = await readInventory(controller, generation);
+      if (!current()) return;
       const result = validate(raw);
+      renderStockAlerts(raw.inventory);
       inventoryOptions = raw.inventory;
       updateIngredientOptions();
       element("stock-body").replaceChildren();
-      element("history-body").replaceChildren();
       for (const values of result.inventory) row(element("stock-body"), values);
-      for (const item of result.history) row(element("history-body"), item.cells);
+      historyRows = result.history;
+      populateHistoryFilter(result.inventory, selectedHistory);
       if (!result.inventory.length) row(element("stock-body"), ["No ingredients available."], 4);
-      if (!result.history.length) row(element("history-body"), ["No inventory transactions recorded."], 6);
       element("connection-status").textContent = "Connected — Supabase Live";
       element("connection-detail").textContent = "Read-only inventory and history loaded. Quantities are displayed with two decimal places.";
     } catch {
+      if (!current()) return;
       clearTables("Data unavailable. Refresh to try again.");
+      clearStockAlerts("inventory is unavailable. Refresh to try again.");
       element("connection-status").textContent = "Connection unavailable · Data source: Unavailable";
       element("connection-detail").textContent = "No current data is displayed.";
       element("connection-error").textContent = "Inventory could not be loaded or validated. Check the approved connection and try again.";
       element("connection-error").hidden = false;
     } finally {
-      loading = false;
-      refresh.disabled = false;
-      for (const id of ["stock-section", "history-section"]) element(id).setAttribute("aria-busy", "false");
+      if (current()) {
+        activeReadController = null;
+        loading = false;
+        if (!element("history-ingredient").disabled) renderHistory();
+        refresh.disabled = false;
+        for (const id of ["stock-section", "history-section"]) element(id).setAttribute("aria-busy", "false");
+      }
     }
   }
 
 
   function updateIngredientOptions() {
-    for (const id of ["receive-stock-ingredient", "consume-stock-ingredient", "deactivate-ingredient-ingredient"]) {
+    for (const id of ["receive-stock-ingredient", "consume-stock-ingredient", "deactivate-ingredient-ingredient", "record-waste-ingredient"]) {
       const select = element(id);
       const selected = select.value;
       select.replaceChildren();
@@ -245,11 +617,17 @@
       }
       select.value = inventoryOptions.some(item => item.ingredient_id === selected) ? selected : "";
     }
+    updateWasteUnit();
+  }
+
+  function updateWasteUnit() {
+    const item = inventoryOptions.find(item => item.ingredient_id === element("record-waste-ingredient").value);
+    element("waste-unit").textContent = "Unit: " + (item ? item.unit_code : "Select an ingredient");
   }
 
   function updateWriteControls() {
     const signedIn = !!accessToken && Date.now() < expiresAt;
-    element("write-controls").disabled = !writesAvailable || !signedIn || writeBusy || unknownWrite || authorizationDenied;
+    element("write-controls").disabled = !writesAvailable || !canReadInventory() || writeBusy || unknownWrite || authorizationDenied;
     element("sign-in-button").disabled = !available || writeBusy || signedIn;
     element("sign-out").disabled = !signedIn || writeBusy;
   }
@@ -260,6 +638,10 @@
     accessToken = null;
     expiresAt = 0;
     authorizationDenied = false;
+    restaurantSelected = false;
+    clearBusinessData();
+    element("operator-password").value = "";
+    showScreen("LOGGED_OUT");
     if (message) element("auth-status").textContent = message;
     // Session changes never reconcile or clear an UNKNOWN write outcome.
     updateWriteControls();
@@ -287,8 +669,14 @@
   function validatedWrite(id, form) {
     const get = (name) => form.elements.namedItem(name)?.value || "";
     const actions = { "add-ingredient": "add_ingredient", "receive-stock": "receive_stock",
-      "consume-stock": "consume_stock", "deactivate-ingredient": "deactivate_ingredient" };
+      "consume-stock": "consume_stock", "deactivate-ingredient": "deactivate_ingredient", "record-waste": "record_waste" };
     const action = actions[id];
+    if (id === "reactivate-ingredient") {
+      const name = get("name").trim();
+      if (!name || name.length > 200)
+        throw new Error("Enter an existing ingredient name of at most 200 characters.");
+      return { payload: { action: "reactivate_ingredient", name }, advisory: "Reactivation changes status only; no stock is added. " };
+    }
     if (action === "add_ingredient") {
       const name = get("name").trim(), category = get("category").trim(), unit = get("unit_id");
       if (!name || !category || name.length > 200 || category.length > 200)
@@ -306,6 +694,13 @@
       payload: { action, ingredient_id: ingredientId },
       advisory: "Deactivation requires zero stock; the server will verify the current balance. "
     };
+    if (action === "record_waste") {
+      const quantity = get("quantity"), reason = get("reason"), amount = quantityHundredths(quantity);
+      if (amount <= 0n || amount > 999999999999n) throw new Error("Waste quantity must be greater than zero and at most 9999999999.99.");
+      if (ingredient.unit_code === "each" && amount % 100n !== 0n) throw new Error("Quantities for each must be whole numbers.");
+      if (!["spoiled", "damaged", "other"].includes(reason)) throw new Error("Select a valid waste reason.");
+      return { payload: { action, ingredient_id: ingredientId, quantity, reason }, advisory: "Waste is recorded using the server UTC date. " };
+    }
     const quantity = get("quantity"), date = get("date");
     const amount = quantityHundredths(quantity);
     if (amount <= 0n || amount > 999999999999n)
@@ -316,7 +711,13 @@
     let advisory = "";
     if (action === "consume_stock" && amount > quantityHundredths(ingredient.current_balance))
       advisory = "Requested consumption exceeds displayed stock; the server will verify the current balance. ";
-    return { payload: { action, ingredient_id: ingredientId, quantity, date }, advisory };
+    const payload = { action, ingredient_id: ingredientId, quantity, date };
+    if (action === "receive_stock" && get("expires_on") !== "") {
+      const expiry = get("expires_on");
+      if (!validBusinessDate(expiry) || expiry < date) throw new Error("Expiration date must be a valid date on or after the receipt date.");
+      payload.expires_on = expiry;
+    }
+    return { payload, advisory };
   }
 
   async function boundedFetch(url, options, allowEmpty = false) {
@@ -340,9 +741,9 @@
   element("sign-in").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!available || writeBusy || (accessToken && Date.now() < expiresAt)) return;
-    clearSession();
     const email = element("operator-email").value.trim();
     const password = element("operator-password").value;
+    clearSession();
     element("operator-password").value = "";
     if (!email || !password) { element("auth-status").textContent = "Enter your operator email and password."; return; }
     writeBusy = true;
@@ -359,8 +760,12 @@
       if (!Number.isSafeInteger(lifetime) || lifetime <= 0 || lifetime > 86400 ||
           loginStartedAt + lifetime * 1000 <= Date.now()) throw new Error("Invalid session.");
       accessToken = data.access_token;
+      thresholdUserId = typeof data.user?.id === "string" &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(data.user.id) ? data.user.id : null;
+      loadThresholdSettings();
       expiresAt = loginStartedAt + lifetime * 1000;
       expiryTimer = setTimeout(checkSessionExpiry, expiresAt - Date.now());
+      showScreen("RESTAURANT_SELECTION");
       element("auth-status").textContent = writesAvailable
         ? "Signed in. Every inventory action still requires server authorization."
         : "Signed in for authentication testing. Frontend inventory writes remain disabled.";
@@ -371,6 +776,17 @@
       writeBusy = false;
       updateWriteControls();
     }
+  });
+
+  element("select-restaurant").addEventListener("click", () => {
+    checkSessionExpiry();
+    if (!accessToken || Date.now() >= expiresAt || appState !== "RESTAURANT_SELECTION") return;
+    restaurantSelected = true;
+    showScreen("DASHBOARD");
+    if (unknownWrite) element("write-message").textContent = "Outcome unknown. Writes remain blocked. Reconcile history before any retry; signing in again does not reconcile an earlier request.";
+    updateWriteControls();
+    load();
+    loadExpirations();
   });
 
   element("sign-out").addEventListener("click", async () => {
@@ -391,7 +807,7 @@
     }
   });
 
-  for (const id of ["add-ingredient", "receive-stock", "consume-stock", "deactivate-ingredient"]) {
+  for (const id of ["add-ingredient", "receive-stock", "consume-stock", "deactivate-ingredient", "reactivate-ingredient", "record-waste"]) {
     const form = element(id);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -400,6 +816,8 @@
         clearSession("Your session expired. Sign in again.");
         return;
       }
+      if (!canReadInventory()) return;
+      const generation = readGeneration;
       let payload, advisory;
       try { ({ payload, advisory } = validatedWrite(id, form)); }
       catch (error) { element("write-message").textContent = error.message; return; }
@@ -427,6 +845,12 @@
         }
         if (response.status === 200 && data?.ok === true && data.outcome === "COMMITTED") confirmed = true;
         else if ([409, 503].includes(response.status) && data?.outcome === "ROLLED_BACK") {
+          if (id === "reactivate-ingredient" && response.status === 409 &&
+              ["Ingredient not found.", "Ingredient is already active.",
+                "Inactive ingredient has nonzero stock. Reactivation rejected."].includes(data.message)) {
+            element("write-message").textContent = data.message + " No change was committed.";
+            return;
+          }
           element("write-message").textContent = response.status === 409
             ? "Change rejected by an inventory business rule. No change was committed; check stock and ingredient status."
             : "Change failed and was rolled back. Check service availability before another submission.";
@@ -448,14 +872,22 @@
         writeBusy = false;
         updateWriteControls();
       }
-      if (confirmed) {
+      if (confirmed && generation === readGeneration && canReadInventory()) {
         element("write-message").textContent = "Inventory change confirmed. Refreshing live inventory and history…";
         if (readPromise) await readPromise;
+        if (generation !== readGeneration || !canReadInventory()) return;
         await load();
+        if (payload.action === "receive_stock" && generation===readGeneration && canReadInventory()) {
+          if (expirationPromise) await expirationPromise;
+          if (generation===readGeneration && canReadInventory()) await loadExpirations();
+        }
+        if (generation !== readGeneration || !canReadInventory()) return;
         element("write-message").textContent = "Inventory change confirmed. Check the read connection status for refresh results.";
       }
     });
   }
+  showScreen("LOGGED_OUT", false);
+  clearBusinessData();
   updateWriteControls();
   if (available) element("auth-status").textContent = writesAvailable
     ? "Sign in with the approved operator account. Server authorization is required for every write."
@@ -463,10 +895,26 @@
   window.addEventListener("focus", checkSessionExpiry);
   document.addEventListener("visibilitychange", checkSessionExpiry);
 
-  refresh.addEventListener("click", load);
-  if (available) {
-    load();
-  } else {
+  refresh.addEventListener("click", () => { load(); loadExpirations(); });
+  element("refresh-expirations").addEventListener("click", loadExpirations);
+  window.addEventListener("focus", renderExpirations);
+  element("toggle-waste").addEventListener("click", () => {
+    checkSessionExpiry();
+    if (!canReadInventory() || element("write-controls").disabled) return;
+    const form = element("record-waste");
+    form.hidden = !form.hidden;
+    element("toggle-waste").setAttribute("aria-expanded", String(!form.hidden));
+    if (!form.hidden) element("record-waste-ingredient").focus();
+  });
+  element("record-waste-ingredient").addEventListener("change", updateWasteUnit);
+  element("save-thresholds").addEventListener("click", () => saveThresholdSettings());
+  element("reset-thresholds").addEventListener("click", () => saveThresholdSettings(true));
+  element("history-ingredient").addEventListener("change", () => {
+    checkSessionExpiry();
+    renderHistory();
+  });
+  if (!available) {
+    element("auth-status").textContent = "Sign-in is unavailable. Check the public connection configuration.";
     clearTables("Not Connected — no Supabase data has been loaded.");
     element("connection-status").textContent = "Not Connected · Data source: Connection unavailable";
     element("connection-detail").textContent = "Live access is disabled or public project configuration is missing or invalid. Configure week2-config.js and reload.";
